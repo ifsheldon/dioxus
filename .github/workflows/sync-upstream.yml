@@ -22,6 +22,7 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
+          token: ${{ secrets.FORK_AUTOMATION_TOKEN || github.token }}
 
       - name: Configure Git author
         run: |

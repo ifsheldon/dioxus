@@ -24,5 +24,9 @@ release:
 - `dx-x86_64-unknown-linux-musl.sha256`
 
 The workflow skips work when all three assets already exist on the fork release.
-Repository Actions settings must allow `GITHUB_TOKEN` read/write contents access
-so the workflows can push tags, push `main`, create releases, and upload assets.
+Repository Actions settings must allow `GITHUB_TOKEN` read/write contents access.
+For fully unattended syncs and release tags that include upstream workflow file
+changes, also add a `FORK_AUTOMATION_TOKEN` secret that can push workflow-file
+updates, for example a classic personal access token with `repo` and `workflow`
+scopes. Without that secret, tags that point at upstream commits containing
+`.github/workflows/**` changes must be created manually.
