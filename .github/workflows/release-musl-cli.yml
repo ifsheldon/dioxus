@@ -190,6 +190,18 @@ jobs:
             sha256sum -c "${ASSET_PREFIX}.sha256"
           )
 
+      - name: Upload packaged assets
+        if: steps.release.outputs.should_build == 'true'
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ env.ASSET_PREFIX }}-${{ steps.release.outputs.tag }}
+          path: |
+            dist/${{ env.ASSET_PREFIX }}.zip
+            dist/${{ env.ASSET_PREFIX }}.tar.gz
+            dist/${{ env.ASSET_PREFIX }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Publish fork release assets
         if: steps.release.outputs.should_build == 'true'
         env:
