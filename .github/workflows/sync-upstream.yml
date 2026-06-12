@@ -1,0 +1,47 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Merge upstream/main
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork main
+        uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Configure Git author
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream main
+        run: |
+          git remote add upstream https://github.com/DioxusLabs/dioxus.git 2>/dev/null || \
+            git remote set-url upstream https://github.com/DioxusLabs/dioxus.git
+          git fetch --no-tags --prune upstream +refs/heads/main:refs/remotes/upstream/main
+
+      - name: Merge and push upstream changes
+        run: |
+          set -euo pipefail
+
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "Fork main already contains upstream/main."
+            exit 0
+          fi
+
+          git merge --no-edit upstream/main
+          git push origin HEAD:main

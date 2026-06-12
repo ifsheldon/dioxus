@@ -1,0 +1,212 @@
+name: Release musl CLI
+
+on:
+  schedule:
+    - cron: "17,47 * * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream stable release tag to build, such as v0.7.9. Leave empty to use the latest stable release."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-musl-cli-${{ inputs.tag || 'latest-stable' }}
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPOSITORY: DioxusLabs/dioxus
+  MUSL_TARGET: x86_64-unknown-linux-musl
+  ASSET_PREFIX: dx-x86_64-unknown-linux-musl
+
+jobs:
+  release-musl:
+    name: Build and publish x86_64 musl CLI
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v5
+
+      - name: Resolve upstream release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "$REQUESTED_TAG" ]]; then
+            if [[ ! "$REQUESTED_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Only stable release tags like v0.7.9 are supported."
+              exit 1
+            fi
+            gh api "repos/${UPSTREAM_REPOSITORY}/releases/tags/${REQUESTED_TAG}" > upstream-release.json
+          else
+            gh api "repos/${UPSTREAM_REPOSITORY}/releases?per_page=100" > upstream-releases.json
+            jq -c 'map(select(.draft == false and .prerelease == false and (.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$")))) | .[0] // empty' \
+              upstream-releases.json > upstream-release.json
+          fi
+
+          if [[ ! -s upstream-release.json ]]; then
+            echo "::error::No stable upstream release was found."
+            exit 1
+          fi
+
+          if ! jq -e '.draft == false and .prerelease == false and (.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))' upstream-release.json >/dev/null; then
+            echo "::error::The selected upstream release is not a stable release."
+            exit 1
+          fi
+
+          tag="$(jq -r '.tag_name' upstream-release.json)"
+          upstream_url="$(jq -r '.html_url' upstream-release.json)"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "upstream_url=$upstream_url" >> "$GITHUB_OUTPUT"
+
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets > fork-release.json 2>/dev/null; then
+            if jq -e \
+              --arg zip "${ASSET_PREFIX}.zip" \
+              --arg tar "${ASSET_PREFIX}.tar.gz" \
+              --arg sha "${ASSET_PREFIX}.sha256" \
+              '([.assets[].name] as $names | [$zip, $tar, $sha] | all(.[]; . as $asset | $names | index($asset)))' \
+              fork-release.json >/dev/null; then
+              echo "Fork release already has all musl assets for $tag."
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          echo "should_build=true" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch upstream tag
+        id: source
+        if: steps.release.outputs.should_build == 'true'
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          git remote add upstream https://github.com/DioxusLabs/dioxus.git 2>/dev/null || \
+            git remote set-url upstream https://github.com/DioxusLabs/dioxus.git
+          git fetch --force --depth=1 upstream "refs/tags/${TAG}:refs/tags/upstream/${TAG}"
+
+          upstream_sha="$(git rev-list -n 1 "refs/tags/upstream/${TAG}^{commit}")"
+          if git fetch --force --depth=1 origin "refs/tags/${TAG}:refs/tags/origin/${TAG}" 2>/dev/null; then
+            fork_sha="$(git rev-list -n 1 "refs/tags/origin/${TAG}^{commit}")"
+            if [[ "$fork_sha" != "$upstream_sha" ]]; then
+              echo "::error::Fork tag $TAG points at $fork_sha, but upstream points at $upstream_sha."
+              exit 1
+            fi
+          else
+            git push origin "refs/tags/upstream/${TAG}:refs/tags/${TAG}"
+          fi
+
+          git checkout --detach "refs/tags/upstream/${TAG}"
+          echo "sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${upstream_sha:0:7}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve Rust toolchain
+        id: toolchain
+        if: steps.release.outputs.should_build == 'true'
+        run: |
+          set -euo pipefail
+          rust_stable="$(sed -nE 's/^[[:space:]]*rust_stable:[[:space:]]*([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' .github/workflows/publish.yml | head -n 1)"
+          if [[ -z "$rust_stable" ]]; then
+            rust_stable="1.94.0"
+          fi
+          echo "rust_stable=$rust_stable" >> "$GITHUB_OUTPUT"
+
+      - name: Build dx for musl
+        if: steps.release.outputs.should_build == 'true'
+        env:
+          DIOXUS_CLI_GIT_SHA: ${{ steps.source.outputs.sha }}
+          DIOXUS_CLI_GIT_SHA_SHORT: ${{ steps.source.outputs.short_sha }}
+          RUST_STABLE: ${{ steps.toolchain.outputs.rust_stable }}
+        run: |
+          set -euo pipefail
+
+          docker run --rm \
+            -e CARGO_TERM_COLOR=always \
+            -e DIOXUS_CLI_GIT_SHA="$DIOXUS_CLI_GIT_SHA" \
+            -e DIOXUS_CLI_GIT_SHA_SHORT="$DIOXUS_CLI_GIT_SHA_SHORT" \
+            -v "$PWD:/work" \
+            -w /work \
+            "rust:${RUST_STABLE}-alpine" \
+            /bin/sh -euxc '
+              apk add --no-cache \
+                build-base git pkgconfig cmake make perl bash musl-dev ca-certificates \
+                openssl-dev zlib-static openssl-libs-static
+              rustup target add x86_64-unknown-linux-musl
+              export PKG_CONFIG_ALLOW_CROSS=1
+              export PKG_CONFIG_ALL_STATIC=1
+              export OPENSSL_STATIC=1
+              export OPENSSL_LIB_DIR=/usr/lib
+              export OPENSSL_INCLUDE_DIR=/usr/include
+              cargo build --release -p dioxus-cli --target x86_64-unknown-linux-musl --locked
+              strip target/x86_64-unknown-linux-musl/release/dx
+            '
+
+      - name: Package and verify assets
+        if: steps.release.outputs.should_build == 'true'
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          bin="target/${MUSL_TARGET}/release/dx"
+          test -x "$bin"
+          "$bin" --version | tee dx-version.txt
+
+          expected_version="${TAG#v}"
+          if ! grep -Fq "dioxus ${expected_version}" dx-version.txt; then
+            echo "::error::Built dx version did not match ${expected_version}."
+            exit 1
+          fi
+
+          mkdir -p dist
+          cp "$bin" dist/dx
+          (
+            cd dist
+            zip -9 "${ASSET_PREFIX}.zip" dx
+            tar -czf "${ASSET_PREFIX}.tar.gz" dx
+            sha256sum "${ASSET_PREFIX}.tar.gz" "${ASSET_PREFIX}.zip" > "${ASSET_PREFIX}.sha256"
+            unzip -t "${ASSET_PREFIX}.zip"
+            tar -tzf "${ASSET_PREFIX}.tar.gz"
+            sha256sum -c "${ASSET_PREFIX}.sha256"
+          )
+
+      - name: Publish fork release assets
+        if: steps.release.outputs.should_build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+          UPSTREAM_URL: ${{ steps.release.outputs.upstream_url }}
+        run: |
+          set -euo pipefail
+
+          notes_file="$(mktemp)"
+          cat > "$notes_file" <<EOF
+          Musl build of Dioxus CLI for upstream release ${TAG}.
+
+          Upstream release: ${UPSTREAM_URL}
+          Source commit: ${SOURCE_SHA}
+          EOF
+
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG" \
+              --notes-file "$notes_file" \
+              --target "$SOURCE_SHA"
+          fi
+
+          gh release upload "$TAG" \
+            "dist/${ASSET_PREFIX}.zip" \
+            "dist/${ASSET_PREFIX}.tar.gz" \
+            "dist/${ASSET_PREFIX}.sha256" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
